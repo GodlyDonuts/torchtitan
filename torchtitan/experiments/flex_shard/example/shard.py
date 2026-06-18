@@ -22,7 +22,17 @@ from ..flex_shard.placement_contract import (
     PlacementReduceGradResult,
     PlacementUnshardResult,
 )
-from ..flex_shard.utils import _record_comm_if_eager, _record_function_if_eager
+from ..flex_shard.utils import (
+    _record_comm_if_eager,
+    _record_copy_in_if_eager,
+    _record_copy_out_if_eager,
+    _record_function_if_eager,
+)
+from ._pack_utils import (
+    copy_tensor_to_dtype,
+    pack_tensors_into_flat_buffer,
+    pack_tensors_into_flat_buffer_with_scratch,
+)
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -44,6 +54,7 @@ class Shard(Placement):
         pg: Any
         debug_fqn: str | None
         per_rank_param_offsets: list[list[int]]
+        uniform_per_rank_size: int | None
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -104,6 +115,91 @@ class Shard(Placement):
             raise AssertionError("Expected at least one shard to assemble.")
         return torch.cat(per_rank_shards, dim=self.dim)
 
+    def _try_get_contiguous_flat_bucket_view(
+        self,
+        tensors: list[torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Return a flat alias when bucket tensors are already contiguous."""
+        if not tensors:
+            return None
+
+        dtype = tensors[0].dtype
+        device = tensors[0].device
+        non_empty_tensors = [tensor for tensor in tensors if tensor.numel() > 0]
+        if not non_empty_tensors:
+            return tensors[0].reshape(-1)
+
+        first_tensor = non_empty_tensors[0]
+        storage_data_ptr = first_tensor.untyped_storage().data_ptr()
+        expected_storage_offset = first_tensor.storage_offset()
+        total_numel = 0
+        for tensor in tensors:
+            numel = tensor.numel()
+            if numel == 0:
+                continue
+            if tensor.dtype != dtype or tensor.device != device:
+                return None
+            if not tensor.is_contiguous():
+                return None
+            if tensor.untyped_storage().data_ptr() != storage_data_ptr:
+                return None
+            if tensor.storage_offset() != expected_storage_offset:
+                return None
+            expected_storage_offset += numel
+            total_numel += numel
+
+        return torch.as_strided(
+            first_tensor,
+            (total_numel,),
+            (1,),
+            storage_offset=first_tensor.storage_offset(),
+        )
+
+    def _can_split_uniform_dim0_unshard(
+        self,
+        infos: list[ParamInfo],
+        world_size: int,
+    ) -> bool:
+        if self.dim != 0:
+            return False
+        for info in infos:
+            local_numel = self.compute_local_numel(info.global_shape, 0, world_size)
+            for rank in range(1, world_size):
+                if (
+                    self.compute_local_numel(info.global_shape, rank, world_size)
+                    != local_numel
+                ):
+                    return False
+        return True
+
+    def _split_uniform_dim0_unshard(
+        self,
+        gathered: torch.Tensor,
+        infos: list[ParamInfo],
+        world_size: int,
+    ) -> list[torch.Tensor]:
+        split_sizes = [
+            self.compute_local_numel(info.global_shape, 0, world_size) for info in infos
+        ]
+        full_params: list[torch.Tensor] = []
+        split_out: list[torch.Tensor] = []
+        for info, split_size in zip(infos, split_sizes, strict=True):
+            full_param = torch.empty(
+                info.global_shape,
+                dtype=info.unsharded_dtype,
+                device=gathered.device,
+            )
+            full_params.append(full_param)
+            split_out.append(full_param.view(world_size, split_size))
+
+        torch.split_with_sizes_copy(
+            gathered.view(world_size, -1),
+            split_sizes,
+            dim=1,
+            out=split_out,
+        )
+        return full_params
+
     @override
     def prepare_unshard_bucket(
         self,
@@ -114,11 +210,21 @@ class Shard(Placement):
     ) -> PlacementPreparedUnshard:
         """Prepare buffers for the bucket all-gather unshard."""
         ws = mesh.size()
-        dtype = tensors[0].dtype
+        dtype = infos[0].unsharded_dtype
         device = tensors[0].device
 
-        with _record_function_if_eager("FlexShard::all_gather_copy_in", debug_fqn):
-            send_buf = torch.cat([t.reshape(-1) for t in tensors])
+        with _record_copy_in_if_eager():
+            copy_in_scratch: list[torch.Tensor] = []
+            send_buf = None
+            if not torch.compiler.is_compiling():
+                send_buf = self._try_get_contiguous_flat_bucket_view(tensors)
+            if send_buf is None:
+                send_buf, copy_in_scratch = pack_tensors_into_flat_buffer_with_scratch(
+                    tensors,
+                    dtype,
+                )
+            else:
+                send_buf = copy_tensor_to_dtype(send_buf, dtype)
 
             per_rank_sizes: list[int] = []
             per_rank_param_offsets: list[list[int]] = []
@@ -131,20 +237,35 @@ class Shard(Placement):
                 per_rank_sizes.append(offset)
                 per_rank_param_offsets.append(offsets_r)
 
-            gathered = [
-                torch.empty(per_rank_sizes[r], dtype=dtype, device=device)
-                for r in range(ws)
-            ]
+            uniform_per_rank_size = (
+                per_rank_sizes[0]
+                if all(size == per_rank_sizes[0] for size in per_rank_sizes)
+                else None
+            )
+            if uniform_per_rank_size is not None:
+                gathered = [
+                    torch.empty(
+                        ws * uniform_per_rank_size,
+                        dtype=dtype,
+                        device=device,
+                    )
+                ]
+            else:
+                gathered = [
+                    torch.empty(per_rank_sizes[r], dtype=dtype, device=device)
+                    for r in range(ws)
+                ]
 
         return PlacementPreparedUnshard(
             placement=self,
-            buffers=[send_buf, *gathered],
+            buffers=[send_buf, *gathered, *copy_in_scratch],
             placement_state=Shard._UnshardState(
                 infos=infos,
                 world_size=ws,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
                 per_rank_param_offsets=per_rank_param_offsets,
+                uniform_per_rank_size=uniform_per_rank_size,
             ),
         )
 
@@ -157,12 +278,19 @@ class Shard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         send_buf = prepared.buffers[0]
-        gathered = prepared.buffers[1:]
         with _record_comm_if_eager(
             "FlexShard::all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather(gathered, send_buf, group=prepared.placement_state.pg)
+            if prepared.placement_state.uniform_per_rank_size is not None:
+                dist.all_gather_single(
+                    prepared.buffers[1],
+                    send_buf,
+                    group=prepared.placement_state.pg,
+                )
+            else:
+                gathered = prepared.buffers[1 : 1 + prepared.placement_state.world_size]
+                dist.all_gather(gathered, send_buf, group=prepared.placement_state.pg)
 
     @override
     def finish_prepared_unshard(
@@ -175,41 +303,67 @@ class Shard(Placement):
                 "Expected Shard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
-        gathered = prepared.buffers[1:]
-        device = prepared.buffers[0].device
-        with _record_function_if_eager(
-            "FlexShard::all_gather_copy_out",
-            prepared.placement_state.debug_fqn,
-        ):
-            full_params = []
-            for i, info in enumerate(prepared.placement_state.infos):
-                per_rank_shards: list[torch.Tensor] = []
-                for r in range(prepared.placement_state.world_size):
-                    numel = self.compute_local_numel(
-                        info.global_shape,
-                        r,
-                        prepared.placement_state.world_size,
-                    )
-                    shape = self.compute_local_shape(
-                        info.global_shape,
-                        r,
-                        prepared.placement_state.world_size,
-                    )
-                    if numel > 0:
-                        offset = prepared.placement_state.per_rank_param_offsets[r][i]
-                        per_rank_shards.append(
-                            gathered[r][offset : offset + numel].view(shape)
-                        )
-                    else:
-                        per_rank_shards.append(
-                            torch.empty(shape, dtype=info.dtype, device=device)
-                        )
-                full_params.append(
-                    self._assemble_from_shards(
-                        per_rank_shards, info.global_shape, info.dtype
-                    )
+        if prepared.placement_state.uniform_per_rank_size is not None:
+            gathered = [
+                prepared.buffers[1].narrow(
+                    0,
+                    r * prepared.placement_state.uniform_per_rank_size,
+                    prepared.placement_state.uniform_per_rank_size,
                 )
-                del per_rank_shards
+                for r in range(prepared.placement_state.world_size)
+            ]
+        else:
+            gathered = prepared.buffers[1 : 1 + prepared.placement_state.world_size]
+        device = prepared.buffers[0].device
+        with _record_copy_out_if_eager():
+            if (
+                prepared.placement_state.uniform_per_rank_size is not None
+                and self._can_split_uniform_dim0_unshard(
+                    prepared.placement_state.infos,
+                    prepared.placement_state.world_size,
+                )
+            ):
+                full_params = self._split_uniform_dim0_unshard(
+                    prepared.buffers[1],
+                    prepared.placement_state.infos,
+                    prepared.placement_state.world_size,
+                )
+            else:
+                full_params = []
+                for i, info in enumerate(prepared.placement_state.infos):
+                    per_rank_shards: list[torch.Tensor] = []
+                    for r in range(prepared.placement_state.world_size):
+                        numel = self.compute_local_numel(
+                            info.global_shape,
+                            r,
+                            prepared.placement_state.world_size,
+                        )
+                        shape = self.compute_local_shape(
+                            info.global_shape,
+                            r,
+                            prepared.placement_state.world_size,
+                        )
+                        if numel > 0:
+                            offset = prepared.placement_state.per_rank_param_offsets[r][
+                                i
+                            ]
+                            per_rank_shards.append(
+                                gathered[r][offset : offset + numel].view(shape)
+                            )
+                        else:
+                            per_rank_shards.append(
+                                torch.empty(
+                                    shape,
+                                    dtype=info.unsharded_dtype,
+                                    device=device,
+                                )
+                            )
+                    full_params.append(
+                        self._assemble_from_shards(
+                            per_rank_shards, info.global_shape, info.unsharded_dtype
+                        )
+                    )
+                    del per_rank_shards
 
         return PlacementUnshardResult(full_params, prepared.buffers)
 
@@ -219,7 +373,7 @@ class Shard(Placement):
         infos: list[ParamInfo],
         world_size: int,
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
-        dtype = tensors[0].dtype
+        dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
         padded_sizes: list[torch.Size] = []
         for tensor in tensors:
@@ -308,7 +462,7 @@ class Shard(Placement):
             device=send_buf.device,
         )
         with _record_comm_if_eager(
-            "FlexShard::reduce_scatter",
+            "FlexShard::post_backward_reduce",
             prepared.placement_state.debug_fqn,
         ):
             # TODO: Plumb the reduction/scaling policy from SPMD gradient semantics.
