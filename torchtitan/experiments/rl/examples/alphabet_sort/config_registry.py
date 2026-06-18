@@ -19,6 +19,7 @@ from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import (
     CompileConfig,
     DebugConfig,
+    OverrideConfig,
     ParallelismConfig,
     TrainingConfig,
 )
@@ -71,6 +72,7 @@ def rl_grpo_qwen3_0_6b_varlen() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=_qwen3_rl_model_registry("0.6B", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -128,6 +130,7 @@ def rl_grpo_qwen3_0_6b_flex() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=_qwen3_rl_model_registry("0.6B", attn_backend="flex"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -376,6 +379,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=_qwen3_rl_model_registry("1.7B", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-1.7B",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -428,6 +432,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=_qwen3_rl_model_registry("14B", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-14B",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -485,6 +490,7 @@ def rl_grpo_qwen3_moe_debug_varlen() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=model_registry("debugmodel_moe", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="tests/assets/tokenizer",
         num_steps=5,
         num_groups_per_rollout_batch=5,
@@ -558,6 +564,7 @@ def rl_grpo_qwen3_moe_debug_varlen_batch_invariant() -> RLTrainer.Config:
         model_spec=model_registry(
             "debugmodel_moe", attn_backend="varlen", moe_comm_backend="standard"
         ),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="tests/assets/tokenizer",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -623,6 +630,7 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=model_registry("30B-A3B", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-30B-A3B",
         num_steps=10,
         num_groups_per_rollout_batch=5,
@@ -683,6 +691,7 @@ def rl_grpo_qwen3_0_6b_varlen_batch_invariant() -> RLTrainer.Config:
     group_size = 8
     return RLTrainer.Config(
         model_spec=_qwen3_rl_model_registry("0.6B", attn_backend="varlen"),
+        override=OverrideConfig(imports=["torchtitan.overrides.fused_swiglu"]),
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=5,
         num_groups_per_rollout_batch=5,
