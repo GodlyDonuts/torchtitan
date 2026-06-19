@@ -124,6 +124,7 @@ class Decoder(BaseModel):
             object with a ``ParallelismConfig`` in its ``parallelism``
             field; in that case the training/debug setup is skipped.
             """
+            from torchtitan.components.loss import ChunkedCELoss
             from torchtitan.config import ParallelismConfig
             from torchtitan.trainer import Trainer
 
@@ -141,6 +142,10 @@ class Decoder(BaseModel):
                 raise NotImplementedError(
                     "Weight tying is not supported with Pipeline Parallel."
                 )
+
+            loss_config = getattr(config, "loss", None)
+            if isinstance(loss_config, ChunkedCELoss.Config):
+                loss_config.global_vocab_size = self.vocab_size
 
             tp = parallelism.tensor_parallel_degree
             attention = self.first_attention
